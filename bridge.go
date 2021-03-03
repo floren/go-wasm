@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"math"
 	"net/http"
@@ -13,41 +14,23 @@ import (
 	"sync"
 	"syscall"
 	"time"
-	"unsafe"
 
-	"github.com/wasmerio/go-ext-wasm/wasmer"
+	"github.com/wasmerio/wasmer-go/wasmer"
 )
 
 var (
 	undefined = &struct{}{}
-	bridges   = map[string]*Bridge{}
 	mu        sync.RWMutex // to protect bridges
 )
 
-type bctx struct{ n string }
-
-func getCtxData(b *Bridge) (*bctx, error) {
-	mu.Lock()
-	defer mu.Unlock()
-	if _, ok := bridges[b.name]; ok {
-		return nil, fmt.Errorf("bridge with name %s already exists", b.name)
-	}
-
-	bridges[b.name] = b
-	return &bctx{n: b.name}, nil
-}
-
-func getBridge(ctx unsafe.Pointer) *Bridge {
-	ictx := wasmer.IntoInstanceContext(ctx)
-	c := (ictx.Data()).(*bctx)
-	mu.RLock()
-	defer mu.RUnlock()
-	return bridges[c.n]
+func getBridge(ctx interface{}) *Bridge {
+	return ctx.(*Bridge)
 }
 
 type Bridge struct {
 	name     string
-	instance wasmer.Instance
+	store    *wasmer.Store
+	instance *wasmer.Instance
 	exitCode int
 	valueIDX int
 	valueMap map[int]interface{}
@@ -58,38 +41,41 @@ type Bridge struct {
 	cancF    context.CancelFunc
 }
 
-func BridgeFromBytes(name string, bytes []byte, imports *wasmer.Imports) (*Bridge, error) {
+func BridgeFromBytes(name string, bytes []byte, imports *wasmer.ImportObject) (*Bridge, error) {
 	b := new(Bridge)
+	engine := wasmer.NewEngine()
+	b.store = wasmer.NewStore(engine)
+	module, err := wasmer.NewModule(b.store, bytes)
+	if err != nil {
+		return nil, err
+	}
+
+	log.Printf("BridgeFromBytes begins\n")
 	if imports == nil {
-		imports = wasmer.NewImports()
+		imports = wasmer.NewImportObject()
 	}
 
 	b.name = name
-	err := b.addImports(imports)
+	err = b.addImports(imports)
 	if err != nil {
 		return nil, err
 	}
-
-	inst, err := wasmer.NewInstanceWithImports(bytes, imports)
+	log.Printf("imports added\n")
+	inst, err := wasmer.NewInstance(module, imports)
 	if err != nil {
 		return nil, err
 	}
-
-	ctx, err := getCtxData(b)
-	if err != nil {
-		return nil, err
-	}
+	log.Printf("NewInstanceWithImports done\n")
 
 	b.instance = inst
-	inst.SetContextData(ctx)
 	b.addValues()
 	b.refs = make(map[interface{}]int)
 	b.valueIDX = 8
 	return b, nil
 }
 
-func BridgeFromFile(name, file string, imports *wasmer.Imports) (*Bridge, error) {
-	bytes, err := wasmer.ReadBytes(file)
+func BridgeFromFile(name, file string, imports *wasmer.ImportObject) (*Bridge, error) {
+	bytes, err := ioutil.ReadFile(file)
 	if err != nil {
 		return nil, err
 	}
@@ -169,7 +155,6 @@ func (b *Bridge) addValues() {
 						"O_APPEND": syscall.O_APPEND,
 						"O_EXCL":   syscall.O_EXCL,
 					}),
-
 					"write": Func(func(args []interface{}) (interface{}, error) {
 						fd := int(args[0].(float64))
 						offset := int(args[2].(float64))
@@ -205,13 +190,23 @@ func (b *Bridge) check() {
 	}
 }
 
+func (b *Bridge) GetMain() (wasmer.NativeFunction, error) {
+	return b.instance.Exports.GetFunction("run")
+}
+
 // Run start the wasm instance.
 func (b *Bridge) Run(ctx context.Context, init chan error) {
 	b.check()
-	defer b.instance.Close()
+	// what does this do? who knows
+	//defer b.instance.Close()
 
-	run := b.instance.Exports["run"]
-	_, err := run(0, 0)
+	run, err := b.instance.Exports.GetFunction("run")
+	if err != nil {
+		init <- err
+		return
+	}
+
+	_, err = run(0, 0)
 	if err != nil {
 		init <- err
 		return
@@ -230,20 +225,26 @@ func (b *Bridge) Run(ctx context.Context, init chan error) {
 
 func (b *Bridge) mem() []byte {
 	if b.memory == nil {
-		b.memory = b.instance.Memory.Data()
+		mem, err := b.instance.Exports.GetMemory("mem")
+		if err != nil {
+			panic("couldn't get memory")
+		}
+		b.memory = mem.Data()
 	}
-
 	return b.memory
 }
 
 func (b *Bridge) getSP() int32 {
-	spFunc := b.instance.Exports["getsp"]
+	spFunc, err := b.instance.Exports.GetFunction("getsp")
+	if err != nil {
+		panic(fmt.Sprintf("failed to fetch getsp: %v", err))
+	}
 	val, err := spFunc()
 	if err != nil {
 		panic("failed to get sp")
 	}
 
-	return val.ToI32()
+	return val.(int32)
 }
 
 func (b *Bridge) setUint8(offset int32, v uint8) {
@@ -332,7 +333,6 @@ func (b *Bridge) loadValue(addr int32) interface{} {
 	if !math.IsNaN(f) {
 		return f
 	}
-
 	b.valuesMu.RLock()
 	defer b.valuesMu.RUnlock()
 
@@ -410,9 +410,15 @@ func (b *Bridge) storeValue(addr int32, v interface{}) {
 	typeFlag := 0
 	switch rt.Kind() {
 	case reflect.String:
-		typeFlag = 1
+		typeFlag = 2
 	case reflect.Func:
-		typeFlag = 3
+		typeFlag = 4
+	case reflect.Map:
+		typeFlag = 1
+	case reflect.Struct:
+		typeFlag = 1
+	case reflect.Slice:
+		typeFlag = 1
 	}
 	b.setUint32(addr+4, uint32(nanHead|typeFlag))
 	b.setUint32(addr, uint32(ref))
@@ -448,8 +454,11 @@ func arrayObject(name string) *object {
 type Func func(args []interface{}) (interface{}, error)
 
 func (b *Bridge) resume() error {
-	res := b.instance.Exports["resume"]
-	_, err := res()
+	res, err := b.instance.Exports.GetFunction("resume")
+	if err != nil {
+		return err
+	}
+	_, err = res()
 	return err
 }
 
@@ -479,6 +488,7 @@ func (b *Bridge) CallFunc(fn string, args []interface{}) (interface{}, error) {
 	b.valuesMu.RLock()
 	fw, ok := b.valueMap[5].(*object).props[fn]
 	if !ok {
+		b.valuesMu.RUnlock()
 		return nil, fmt.Errorf("missing function: %v", fn)
 	}
 	this := b.valueMap[6]
