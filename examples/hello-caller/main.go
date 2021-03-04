@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+
 	"github.com/vedhavyas/go-wasm"
 )
 
@@ -10,15 +12,11 @@ func main() {
 		panic(err)
 	}
 
-	/*
-		ctx, canc := context.WithCancel(context.Background())
-		defer canc()
-		init := make(chan error)
-		go b.Run(ctx, init)
-		if err := <-init; err != nil {
-			panic(err)
-		}
-	*/
-	run, _ := b.GetMain()
-	run(0, 0)
+	ctx, canc := context.WithCancel(context.Background())
+	defer canc()
+	init := make(chan error)
+	go b.Run(ctx, init)
+	if err := <-init; err != nil {
+		panic(err)
+	}
 }

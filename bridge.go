@@ -50,7 +50,6 @@ func BridgeFromBytes(name string, bytes []byte, imports *wasmer.ImportObject) (*
 		return nil, err
 	}
 
-	log.Printf("BridgeFromBytes begins\n")
 	if imports == nil {
 		imports = wasmer.NewImportObject()
 	}
@@ -60,12 +59,10 @@ func BridgeFromBytes(name string, bytes []byte, imports *wasmer.ImportObject) (*
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("imports added\n")
 	inst, err := wasmer.NewInstance(module, imports)
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("NewInstanceWithImports done\n")
 
 	b.instance = inst
 	b.addValues()
@@ -188,10 +185,6 @@ func (b *Bridge) check() {
 	if b.exited {
 		panic("WASM instance already exited")
 	}
-}
-
-func (b *Bridge) GetMain() (wasmer.NativeFunction, error) {
-	return b.instance.Exports.GetFunction("run")
 }
 
 // Run start the wasm instance.

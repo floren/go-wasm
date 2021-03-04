@@ -21,7 +21,9 @@ func wexit(env interface{}, v []wasmer.Value) (out []wasmer.Value, err error) {
 	b := getBridge(env)
 	sp := v[0].I32()
 	b.exitCode = int(b.getUint32(sp + 8))
-	b.cancF()
+	if b.cancF != nil {
+		b.cancF()
+	}
 	return
 }
 
